@@ -1,164 +1,101 @@
-import heapq
+import heapq, struct
+from collections import Counter
 
-MAGIC = b"MHF1"   # marks our compressed files
-ESC = 256         # special symbol that stands for ALL rare symbols
+ESC = 256  # one shared leaf that stands for ALL rare symbols
 
 
 def build_codes(counts):
-    # build Huffman codes from {symbol: count}
-    heap = []
-    order = 0                                   # unique number -> same tie-breaking every time
-    for sym in sorted(counts):
-        heap.append((counts[sym], order, sym))
-        order += 1
+    """Huffman codes from {symbol: count}. Same input -> same codes."""
+    heap = [(c, i, s) for i, (s, c) in enumerate(sorted(counts.items()))]
     heapq.heapify(heap)
+    n = len(heap)
     while len(heap) > 1:
-        c1, _, n1 = heapq.heappop(heap)
-        c2, _, n2 = heapq.heappop(heap)
-        heapq.heappush(heap, (c1 + c2, order, (n1, n2)))
-        order += 1
+        c1, _, a = heapq.heappop(heap)
+        c2, _, b = heapq.heappop(heap)
+        heapq.heappush(heap, (c1 + c2, n, (a, b)))
+        n += 1
     codes = {}
-    stack = [(heap[0][2], "")] if heap else []
-    while stack:
-        node, code = stack.pop()
+
+    def walk(node, code):
         if isinstance(node, tuple):
-            stack.append((node[0], code + "0"))
-            stack.append((node[1], code + "1"))
+            walk(node[0], code + "0")
+            walk(node[1], code + "1")
         else:
-            codes[node] = code or "0"           # only one symbol -> code "0"
+            codes[node] = code or "0"      # single symbol -> "0"
+
+    if heap:
+        walk(heap[0][2], "")
     return codes
 
 
 def compress(data, limit):
-    # data = bytes. Returns (frequent counts, rare total, bit string)
-    counts = {}
-    for b in data:
-        counts[b] = counts.get(b, 0) + 1
-    frequent = {s: c for s, c in counts.items() if c / len(data) >= limit}
-    rare_total = sum(c for s, c in counts.items() if s not in frequent)
-
-    tree_counts = dict(frequent)
-    if rare_total > 0:
-        tree_counts[ESC] = rare_total           # all rare symbols share ONE leaf
-    codes = build_codes(tree_counts)
-
-    parts = []
-    for b in data:
-        if b in codes:
-            parts.append(codes[b])
-        else:                                   # rare: ESC code + raw 8 bits
-            parts.append(codes[ESC] + format(b, "08b"))
-    return frequent, rare_total, "".join(parts)
+    freq = {s: c for s, c in Counter(data).items() if c >= limit * len(data)}
+    rare = len(data) - sum(freq.values())
+    codes = build_codes({**freq, **({ESC: rare} if rare else {})})
+    # rare byte = ESC code + its raw 8 bits
+    bits = "".join(codes.get(b) or codes[ESC] + f"{b:08b}" for b in data)
+    packed = bytes(int(bits[i:i + 8].ljust(8, "0"), 2) for i in range(0, len(bits), 8))
+    header = struct.pack(">IH", len(data), len(freq))
+    header += b"".join(struct.pack(">BI", s, c) for s, c in sorted(freq.items()))
+    header += struct.pack(">I", rare)
+    return header + packed
 
 
-def decompress(counts, rare_total, bits, length):
-    # rebuild the same codes, then decode bit by bit
-    out = bytearray()
-    if length == 0:
-        return out
-    if rare_total > 0:
-        counts[ESC] = rare_total
-    table = {code: sym for sym, code in build_codes(counts).items()}
-    i = 0
-    while len(out) < length:
-        code = ""
-        while code not in table:
-            if i >= len(bits):
-                raise ValueError("The compressed data ended too early.")
+def decompress(blob):
+    length, n = struct.unpack_from(">IH", blob)
+    pos = 6 + 5 * n + 4
+    counts = {s: c for s, c in struct.iter_unpack(">BI", blob[6:pos - 4])}
+    rare, = struct.unpack_from(">I", blob, pos - 4)
+    if sum(counts.values()) + rare != length:
+        raise ValueError("Not a valid compressed file.")
+    if rare:
+        counts[ESC] = rare
+    table = {code: s for s, code in build_codes(counts).items()}
+    bits = "".join(f"{b:08b}" for b in blob[pos:])
+    out, code, i = bytearray(), "", 0
+    try:
+        while len(out) < length:
             code += bits[i]
             i += 1
-        sym = table[code]
-        if sym == ESC:                          # next 8 bits = the rare symbol
-            if i + 8 > len(bits):
-                raise ValueError("The compressed data ended too early.")
-            sym = int(bits[i:i + 8], 2)
-            i += 8
-        out.append(sym)
-    return out
+            if code in table:
+                sym, code = table[code], ""
+                if sym == ESC:
+                    sym = int(bits[i:i + 8], 2)
+                    i += 8
+                out.append(sym)
+    except (IndexError, ValueError):
+        raise ValueError("The compressed data ended too early.")
+    return bytes(out)
 
 
-def do_compress():
-    name = input("Input file: ").strip()
-    out = input("Compressed file: ").strip()
-    if name == out:
-        raise ValueError("Input and output files must be different.")
-    try:
-        limit = float(input("Minimum symbol probability limit (0 to 1): "))
-    except ValueError:
-        raise ValueError("The limit must be a number.")
-    if not 0 <= limit <= 1:
-        raise ValueError("The limit must be between 0 and 1.")
-
-    data = open(name, "rb").read()              # binary mode keeps every byte exactly
-    frequent, rare_total, bits = compress(data, limit)
-
-    bits_len = len(bits)
-    bits += "0" * (-len(bits) % 8)              # pad to whole bytes
-    packed = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
-
-    header = MAGIC + len(data).to_bytes(4, "big") + len(frequent).to_bytes(2, "big")
-    for s in sorted(frequent):
-        header += bytes([s]) + frequent[s].to_bytes(4, "big")
-    header += rare_total.to_bytes(4, "big")
-
-    f = open(out, "wb")
-    f.write(header + packed)
-    f.close()
-
-    print("Original Size =", len(data), "*", 8, "=", len(data) * 8, "bits")
-    print("Data bits =", bits_len, "bits (", len(packed), "bytes after packing )")
-    print("Header =", len(header), "bytes =", len(header) * 8, "bits")
-    print("Compressed Size =", (len(header) + len(packed)) * 8, "bits")
-    print("Rare symbols merged into ESC:", len(set(data)) - len(frequent))
-
-
-def do_decompress():
-    name = input("Compressed file: ").strip()
-    out = input("Output file: ").strip()
-    if name == out:
-        raise ValueError("Input and output files must be different.")
-    blob = open(name, "rb").read()
-
-    if len(blob) < 14 or blob[:4] != MAGIC:
-        raise ValueError("This is not a valid compressed file.")
-    length = int.from_bytes(blob[4:8], "big")
-    n = int.from_bytes(blob[8:10], "big")
-    header_size = 10 + 5 * n + 4
-    if n > 256 or len(blob) < header_size:
-        raise ValueError("The compressed file header is damaged.")
-    counts = {}
-    for i in range(n):
-        pos = 10 + 5 * i
-        counts[blob[pos]] = int.from_bytes(blob[pos + 1:pos + 5], "big")
-    rare_total = int.from_bytes(blob[header_size - 4:header_size], "big")
-    if sum(counts.values()) + rare_total != length:
-        raise ValueError("The compressed file header is damaged.")
-
-    bits = "".join(format(b, "08b") for b in blob[header_size:])   # unpack bytes -> bits
-    data = decompress(counts, rare_total, bits, length)
-
-    f = open(out, "wb")
-    f.write(data)
-    f.close()
-    print("Done")
-
-
-while True:
-    print("\n1. Compress")
-    print("2. Decompress")
-    print("3. Exit")
-    choice = input("Choose: ").strip()
-    if choice == "3":
-        break
-    elif choice in ("1", "2"):
+def main():
+    while True:
+        choice = input("\n1. Compress\n2. Decompress\n3. Exit\nChoose: ").strip()
+        if choice == "3":
+            return
+        if choice not in ("1", "2"):
+            print("Wrong choice")
+            continue
         try:
+            src = input("Input file: ").strip()
+            dst = input("Output file: ").strip()
+            if src == dst:
+                raise ValueError("Input and output files must be different.")
+            data = open(src, "rb").read()
             if choice == "1":
-                do_compress()
+                limit = float(input("Minimum symbol probability (0 to 1): "))
+                if not 0 <= limit <= 1:
+                    raise ValueError("The limit must be between 0 and 1.")
+                result = compress(data, limit)
+                print(f"Original: {len(data) * 8} bits | Compressed: {len(result) * 8} bits "
+                      f"({len(result) / max(len(data), 1):.0%} of original)")
             else:
-                do_decompress()
-        except FileNotFoundError:
-            print("Error: file not found.")
-        except (ValueError, OSError) as e:
+                result = decompress(data)
+                print("Done")
+            open(dst, "wb").write(result)
+        except (ValueError, OSError, struct.error) as e:
             print("Error:", e)
-    else:
-        print("Wrong choice")
+
+
+if __name__ == "__main__":
+    main()
